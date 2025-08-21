@@ -1,124 +1,87 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
-import json
-import os
-import random
-
-TOKEN = os.getenv("TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+import yt_dlp
+import asyncio
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-QUIZ_FILE = "quiz.json"
-QUIZ3_FILE = "3quiz.json"
+queue = []
 
+def yt_dl_source(url):
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "default_search": "auto",
+        "noplaylist": True,
+    }
+with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        audio_url = info['url']
+        title = info.get('title', url)
+        webpage_url = info.get('webpage_url', url)
+        thumbnail = info.get('thumbnail', None)
+        return audio_url, title, webpage_url, thumbnail
 
-def load_json(filename):
-    if not os.path.exists(filename):
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
-    with open(filename, "r", encoding="utf-8") as f:
-        return json.load(f)
+async def play_next(ctx):
+    if queue:
+        url = queue.pop(0)
+        audio_url, title, webpage_url, thumbnail = yt_dl_source(url)
+        source = await discord.FFmpegOpusAudio.from_probe(audio_url)
+        ctx.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
 
-
-def save_json(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-@bot.event
-async def on_ready():
-    print(f"✅ Bot logged in as {bot.user}")
-    try:
-        synced = await bot.tree.sync()
-        print(f"🔧 Synced {len(synced)} commands")
-    except Exception as e:
-        print(f"❌ Sync error: {e}")
-
-
-# -------------------- /quiz --------------------
-@bot.tree.command(name="quiz", description="quiz.jsonからクイズを出題 (記述式)")
-async def quiz(interaction: discord.Interaction):
-    quiz_data = load_json(QUIZ_FILE)
-    if not quiz_data:
-        await interaction.response.send_message("❌ クイズがまだありません。")
-        return
-
-    q = random.choice(quiz_data)
-    await interaction.response.send_message(f"📝 問題: {q['question']}")
-
-    def check(msg: discord.Message):
-        return msg.author.id == interaction.user.id and msg.channel == interaction.channel
-
-    try:
-        msg = await bot.wait_for("message", timeout=30.0, check=check)
-    except:
-        await interaction.followup.send("⌛ 時間切れ！")
-        return
-
-    if msg.content.strip().lower() == q["answer"].lower():
-        await interaction.followup.send("⭕ 正解！")
+        # Embedでタイトル＋サムネイルを送信
+        embed = discord.Embed(title=f"Now Playing: {title}", url=webpage_url, description=f"リクエスト: {ctx.author.display_name}")
+        if thumbnail:
+            embed.set_thumbnail(url=thumbnail)
+        await ctx.send(embed=embed)
     else:
-        await interaction.followup.send(f"❌ 不正解！正解は `{q['answer']}` です。")
+        await ctx.send("再生する曲はありません。")
 
+@bot.command()
+async def join(ctx):
+    if ctx.author.voice:
+        await ctx.author.voice.channel.connect()
+        await ctx.send("ボイスチャンネルに入りました。")
+    else:
+        await ctx.send("先にボイスチャンネルに入ってください。")
 
-# -------------------- /quiz-set --------------------
-@bot.tree.command(name="quiz-set", description="quiz.jsonにクイズを追加 (管理者のみ)")
-async def quiz_set(interaction: discord.Interaction, question: str, answer: str):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
-        return
+@bot.command()
+async def leave(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send("退出しました。")
 
-    quiz_data = load_json(QUIZ_FILE)
-    quiz_data.append({"question": question, "answer": answer})
-    save_json(QUIZ_FILE, quiz_data)
-    await interaction.response.send_message(f"✅ クイズを追加しました！\nQ: {question}\nA: {answer}")
+@bot.command()
+async def play(ctx, *, url):
+    if not ctx.voice_client:
+        await ctx.invoke(bot.get_command("join"))
+    queue.append(url)
+    if not ctx.voice_client.is_playing():
+        await play_next(ctx)
+    else:
+        await ctx.send("キューに追加しました。")
 
+@bot.command()
+async def skip(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.send("次の曲にスキップしました。")
 
-# -------------------- /3quiz --------------------
-@bot.tree.command(name="3quiz", description="3quiz.jsonから3択クイズを出題")
-async def quiz3(interaction: discord.Interaction):
-    quiz_data = load_json(QUIZ3_FILE)
-    if not quiz_data:
-        await interaction.response.send_message("❌ 3択クイズがまだありません。")
-        return
+@bot.command()
+async def stop(ctx):
+    if ctx.voice_client:
+        queue.clear()
+        ctx.voice_client.stop()
+        await ctx.send("再生を停止し、キューを空にしました。")
 
-    q = random.choice(quiz_data)
-    question = q["question"]
-    answer = q["answer"]
-    choices = [answer, q["dummy1"], q["dummy2"]]
-    random.shuffle(choices)
+@bot.command()
+async def queue_list(ctx):
+    if queue:
+        msg = "キュー:\n" + "\n".join(f"{i+1}. {url}" for i, url in enumerate(queue))
+        await ctx.send(msg)
+    else:
+        await ctx.send("キューは空です。")
 
-    view = discord.ui.View()
-    for choice in choices:
-        async def button_callback(interact: discord.Interaction, choice=choice):
-            if choice == answer:
-                await interact.response.send_message("⭕ 正解！", ephemeral=True)
-            else:
-                await interact.response.send_message(f"❌ 不正解！正解は `{answer}` です。", ephemeral=True)
-
-        button = discord.ui.Button(label=choice, style=discord.ButtonStyle.primary)
-        button.callback = button_callback
-        view.add_item(button)
-
-    await interaction.response.send_message(f"📝 問題: {question}", view=view)
-
-
-# -------------------- /3quiz-set --------------------
-@bot.tree.command(name="3quiz-set", description="3quiz.jsonに3択クイズを追加 (管理者のみ)")
-async def quiz3_set(interaction: discord.Interaction, question: str, answer: str, dummy1: str, dummy2: str):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
-        return
-
-    quiz_data = load_json(QUIZ3_FILE)
-    quiz_data.append({"question": question, "answer": answer, "dummy1": dummy1, "dummy2": dummy2})
-    save_json(QUIZ3_FILE, quiz_data)
-    await interaction.response.send_message(
-        f"✅ 3択クイズを追加しました！\nQ: {question}\nA: {answer}\n選択肢: {answer}, {dummy1}, {dummy2}"
-    )
-
-
-bot.run(TOKEN)
+bot.run("YOUR_DISCORD_BOT_TOKEN")
